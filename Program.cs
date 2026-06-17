@@ -10,6 +10,7 @@
 //   '4' 0x34 → MEM  0x49      '9' 0x39 → VOL  0x10
 //   '5' 0x35 → DISK 0x4F      '<' 0x3C → BAT  0x1A
 
+using System.Diagnostics;
 using System.IO.Ports;
 using System.Management;
 using System.Net.NetworkInformation;
@@ -129,17 +130,21 @@ sealed class HardwareMonitor : IDisposable
 
             ReadFan(hw);
         }
+
+        // WMI fallback for fan RPM when no SuperIO/EC is detected by LHM
+        if (FanRpm == 0) FanRpm = WinMetrics.GetWmiFanRpm();
     }
 
     private void ReadCpu(IHardware hw)
     {
-        float temp = 0, usage = 0, usageFallback = 0, freq = 0;
+        float temp = 0, usage = 0, freq = 0;
+        var coreLoads = new List<float>();
+
         foreach (var s in hw.Sensors)
         {
             if (s.Value is null) continue;
             switch (s.SensorType)
             {
-                // Accept any temperature sensor — covers Intel "Package", AMD "Tdie"/"Tctl", etc.
                 case SensorType.Temperature:
                     if (s.Value > temp) temp = s.Value.Value;
                     break;
@@ -149,9 +154,10 @@ sealed class HardwareMonitor : IDisposable
                     usage = s.Value.Value;
                     break;
 
-                // Fallback: first load sensor if "Total" is not present
-                case SensorType.Load:
-                    if (usageFallback == 0) usageFallback = s.Value.Value;
+                // Collect individual core/thread loads for averaging fallback
+                case SensorType.Load
+                    when s.Name.StartsWith("CPU Core", StringComparison.OrdinalIgnoreCase):
+                    coreLoads.Add(s.Value.Value);
                     break;
 
                 case SensorType.Clock
@@ -160,9 +166,17 @@ sealed class HardwareMonitor : IDisposable
                     break;
             }
         }
+
+        // LHM "CPU Total" is always 0 on Intel Core Ultra (Meteor Lake) — average cores instead
+        if (usage == 0 && coreLoads.Count > 0)
+            usage = coreLoads.Average();
+
+        // Temp and freq fallbacks for CPUs LHM can't read via MSR yet
+        if (temp == 0) temp = WinMetrics.GetAcpiCpuTempC();
+        if (freq == 0) freq = WinMetrics.GetCpuFreqMHz();
+
         if (temp  > 0) CpuTemp    = temp;
-        float finalUsage = usage > 0 ? usage : usageFallback;
-        if (finalUsage > 0) CpuUsage   = finalUsage;
+        if (usage > 0) CpuUsage   = usage;
         if (freq  > 0) CpuFreqMHz = freq;
     }
 
@@ -177,12 +191,13 @@ sealed class HardwareMonitor : IDisposable
                 case SensorType.Temperature:
                     if (s.Value > temp) temp = s.Value.Value;
                     break;
+                // Intel Arc exposes "D3D 3D" as its primary 3D load sensor
                 case SensorType.Load
                     when s.Name.Contains("Core", StringComparison.OrdinalIgnoreCase)
-                      || s.Name.Contains("GPU",  StringComparison.OrdinalIgnoreCase):
-                    usage = s.Value.Value;
+                      || s.Name.Contains("GPU",  StringComparison.OrdinalIgnoreCase)
+                      || s.Name == "D3D 3D":
+                    if (s.Value > usage) usage = s.Value.Value;
                     break;
-                // Fallback: first load sensor found (D3D, shader, etc.)
                 case SensorType.Load:
                     if (usageFallback == 0) usageFallback = s.Value.Value;
                     break;
@@ -197,7 +212,10 @@ sealed class HardwareMonitor : IDisposable
     {
         foreach (var s in hw.Sensors)
         {
-            if (s.SensorType == SensorType.Temperature && s.Value is > 0)
+            // Skip threshold sensors like "Warning Temperature" and "Critical Temperature"
+            if (s.SensorType == SensorType.Temperature && s.Value is > 0 &&
+                !s.Name.Contains("Warning",  StringComparison.OrdinalIgnoreCase) &&
+                !s.Name.Contains("Critical", StringComparison.OrdinalIgnoreCase))
             {
                 DiskTempC = s.Value.Value;
                 return;
@@ -215,6 +233,33 @@ sealed class HardwareMonitor : IDisposable
                 return;
             }
         }
+    }
+
+    public void DumpSensors()
+    {
+        Console.WriteLine("\n═══ LibreHardwareMonitor sensor dump ═══");
+        foreach (var hw in _computer.Hardware)
+        {
+            hw.Update();
+            Console.WriteLine($"\n[{hw.HardwareType}] {hw.Name}");
+            foreach (var s in hw.Sensors)
+                Console.WriteLine($"  {s.SensorType,-15} \"{s.Name}\"  =  {s.Value?.ToString("F2") ?? "null"}");
+
+            foreach (var sub in hw.SubHardware)
+            {
+                sub.Update();
+                Console.WriteLine($"  └─ [{sub.HardwareType}] {sub.Name}");
+                foreach (var s in sub.Sensors)
+                    Console.WriteLine($"       {s.SensorType,-15} \"{s.Name}\"  =  {s.Value?.ToString("F2") ?? "null"}");
+            }
+        }
+        Console.WriteLine("\n═══ WMI / ACPI fallbacks ═══");
+        Console.WriteLine($"  CPU Freq PC    : {WinMetrics.GetCpuFreqMHz():F0} MHz");
+        Console.WriteLine($"  WMI Fan RPM    : {WinMetrics.GetWmiFanRpm():F0}");
+        Console.WriteLine($"  ACPI CPU Temp  : {WinMetrics.GetAcpiCpuTempC():F1} °C  (both methods)");
+        Console.WriteLine("\n  — Extended WMI scan —");
+        WinMetrics.DumpWmiThermalFan();
+        Console.WriteLine("═══════════════════════════════════════");
     }
 
     public void Dispose() => _computer.Close();
@@ -351,6 +396,156 @@ static class WinMetrics
         .Replace("HYNIX", "SK hynix")
         .Replace("Hynix",  "SK hynix")
         .Trim();
+
+    // ── CPU Temperature — two fallbacks for LHM-unsupported CPUs ─────────────
+    public static float GetAcpiCpuTempC()
+    {
+        // Attempt 1: MSAcpi_ThermalZoneTemperature (root\WMI)
+        try
+        {
+            using var s1 = new ManagementObjectSearcher(
+                @"root\wmi", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
+            float maxC = 0;
+            foreach (ManagementObject obj in s1.Get())
+            {
+                float c = (float)(Convert.ToDouble(obj["CurrentTemperature"]) / 10.0 - 273.15);
+                if (c > maxC && c < 150) maxC = c;
+            }
+            if (maxC > 0) return maxC;
+        }
+        catch { }
+
+        // Attempt 2: Win32 Perf Counter thermal zones (root\CIMV2)
+        try
+        {
+            using var s2 = new ManagementObjectSearcher(
+                "SELECT HighPrecisionTemperature FROM " +
+                "Win32_PerfFormattedData_Counters_ThermalZoneInformation");
+            float maxC = 0;
+            foreach (ManagementObject obj in s2.Get())
+            {
+                ulong raw = Convert.ToUInt64(obj["HighPrecisionTemperature"]);
+                float c   = (float)(raw / 10.0 - 273.15);
+                if (c > maxC && c < 150) maxC = c;
+            }
+            if (maxC > 0) return maxC;
+        }
+        catch { }
+
+        return 0;
+    }
+
+    // ── CPU Frequency via Performance Counter ─────────────────────────────────
+    private static PerformanceCounter? _freqCounter;
+    public static float GetCpuFreqMHz()
+    {
+        try
+        {
+            _freqCounter ??= new PerformanceCounter(
+                "Processor Information", "Processor Frequency", "_Total");
+            return _freqCounter.NextValue();
+        }
+        catch { return 0; }
+    }
+
+    // ── Fan RPM — multiple fallbacks ──────────────────────────────────────────
+    public static float GetWmiFanRpm()
+    {
+        // Win32_Fan (rarely populated on modern systems)
+        try
+        {
+            using var s1 = new ManagementObjectSearcher("SELECT DesiredSpeed FROM Win32_Fan");
+            foreach (ManagementObject obj in s1.Get())
+            {
+                float rpm = Convert.ToSingle(obj["DesiredSpeed"] ?? 0);
+                if (rpm > 0) return rpm;
+            }
+        }
+        catch { }
+
+        // Win32_PerfFormattedData_Counters_FanInformation (some OEM boards)
+        try
+        {
+            using var s2 = new ManagementObjectSearcher(
+                "SELECT RotationsPerMinute FROM Win32_PerfFormattedData_Counters_FanInformation");
+            foreach (ManagementObject obj in s2.Get())
+            {
+                float rpm = Convert.ToSingle(obj["RotationsPerMinute"] ?? 0);
+                if (rpm > 0) return rpm;
+            }
+        }
+        catch { }
+
+        return 0;
+    }
+
+    // ── WMI namespace / class scanner used by --debug ─────────────────────────
+    public static void DumpWmiThermalFan()
+    {
+        // Perf counter thermal zones (shows zone names + temps)
+        Console.WriteLine("\n  [Win32_PerfFormattedData_Counters_ThermalZoneInformation]");
+        try
+        {
+            using var s = new ManagementObjectSearcher(
+                "SELECT Name,HighPrecisionTemperature FROM " +
+                "Win32_PerfFormattedData_Counters_ThermalZoneInformation");
+            foreach (ManagementObject obj in s.Get())
+            {
+                ulong raw = Convert.ToUInt64(obj["HighPrecisionTemperature"]);
+                float c   = (float)(raw / 10.0 - 273.15);
+                Console.WriteLine($"    Name={obj["Name"]}  Temp={c:F1} °C");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"    Error: {ex.Message}"); }
+
+        // All ACPI thermal zones with names
+        Console.WriteLine("\n  [MSAcpi_ThermalZoneTemperature — root\\WMI]");
+        try
+        {
+            using var s = new ManagementObjectSearcher(
+                @"root\wmi",
+                "SELECT InstanceName,CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
+            foreach (ManagementObject obj in s.Get())
+            {
+                float c = (float)(Convert.ToDouble(obj["CurrentTemperature"]) / 10.0 - 273.15);
+                Console.WriteLine($"    Zone={obj["InstanceName"]}  Temp={c:F1} °C");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"    Error: {ex.Message}"); }
+
+        // Fan perf counter
+        Console.WriteLine("\n  [Win32_PerfFormattedData_Counters_FanInformation]");
+        try
+        {
+            using var s = new ManagementObjectSearcher(
+                "SELECT Name,RotationsPerMinute FROM " +
+                "Win32_PerfFormattedData_Counters_FanInformation");
+            foreach (ManagementObject obj in s.Get())
+                Console.WriteLine($"    Name={obj["Name"]}  RPM={obj["RotationsPerMinute"]}");
+        }
+        catch (Exception ex) { Console.WriteLine($"    Error: {ex.Message}"); }
+
+        // Scan root\WMI for any class with Fan or Thermal in the name
+        Console.WriteLine("\n  [root\\WMI classes matching Fan|Thermal|Temp|Intel|Power]");
+        try
+        {
+            var scope = new ManagementScope(@"root\wmi");
+            scope.Connect();
+            using var query = new ManagementObjectSearcher(
+                scope, new ObjectQuery("SELECT * FROM meta_class"));
+            foreach (ManagementClass cls in query.Get().Cast<ManagementClass>())
+            {
+                string n = cls.ClassPath.ClassName;
+                if (n.Contains("Fan",     StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Thermal", StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Temp",    StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Intel",   StringComparison.OrdinalIgnoreCase) ||
+                    n.Contains("Power",   StringComparison.OrdinalIgnoreCase))
+                    Console.WriteLine($"    {n}");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"    Error: {ex.Message}"); }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -856,6 +1051,7 @@ class Program
     static void Main(string[] args)
     {
         bool showDashboard = args.Contains("--dashboard");
+        bool debugSensors  = args.Contains("--debug");
         string portName    = Env("ATOMMAN_PORT", DefaultPort);
 
         // First non-flag arg can be port name (e.g. "COM4")
@@ -867,6 +1063,14 @@ class Program
         Console.WriteLine("[AtomMan] NOTE: Run as Administrator for CPU/GPU temperatures.");
 
         using var hw = new HardwareMonitor();
+
+        if (debugSensors)
+        {
+            hw.DumpSensors();
+            Console.WriteLine("\nPress any key to exit...");
+            Console.ReadKey();
+            return;
+        }
         var weather  = new WeatherCache(ApiKey, Location, Units);
         var net      = new NetMeter();
 
