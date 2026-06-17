@@ -1,0 +1,964 @@
+// AtomMan Serial Display Daemon — C# + LibreHardwareMonitor
+// ============================================================
+// Protocol (from screen.py / README):
+//   ENQ  (display → host):  AA 05 <SEQ_ASCII> CC 33 C3 3C
+//   REPLY (host → display): AA <TileID> 00 <SEQ_ASCII> {ASCII payload} CC 33 C3 3C
+//
+// Tile map (SEQ ASCII → TileID):
+//   '2' 0x32 → CPU  0x53      '6' 0x36 → DATE 0x6B
+//   '3' 0x33 → GPU  0x36      '7' 0x37 → NET  0x27
+//   '4' 0x34 → MEM  0x49      '9' 0x39 → VOL  0x10
+//   '5' 0x35 → DISK 0x4F      '<' 0x3C → BAT  0x1A
+
+using System.IO.Ports;
+using System.Management;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using LibreHardwareMonitor.Hardware;
+using NAudio.CoreAudioApi;
+
+namespace AtomManDisplay;
+
+// ═══════════════════════════════════════════════════════════════
+//  TILE CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+static class Tile
+{
+    public const byte CPU = 0x53;
+    public const byte GPU = 0x36;
+    public const byte MEM = 0x49;
+    public const byte DSK = 0x4F;
+    public const byte DAT = 0x6B;
+    public const byte NET = 0x27;
+    public const byte VOL = 0x10;
+    public const byte BAT = 0x1A;
+
+    /// <summary>Fixed SEQ ASCII byte the host sends for each tile (steady-state).</summary>
+    public static byte SeqFor(byte tileId) => tileId switch
+    {
+        CPU => (byte)'2',
+        GPU => (byte)'3',
+        MEM => (byte)'4',
+        DSK => (byte)'5',
+        DAT => (byte)'6',
+        NET => (byte)'7',
+        VOL => (byte)'9',
+        BAT => (byte)'<',
+        _   => (byte)'2',
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LIBREHARDWAREMONITOR WRAPPER
+// ═══════════════════════════════════════════════════════════════
+sealed class HardwareMonitor : IDisposable
+{
+    private readonly Computer _computer;
+
+    public float  CpuTemp    { get; private set; }
+    public float  CpuUsage   { get; private set; }
+    public float  CpuFreqMHz { get; private set; }
+    public string CpuName    { get; private set; } = "CPU";
+
+    public float  GpuTemp    { get; private set; }
+    public float  GpuUsage   { get; private set; }
+    public string GpuName    { get; private set; } = "GPU";
+
+    public float  FanRpm     { get; private set; }
+    public float  DiskTempC  { get; private set; }
+
+    public HardwareMonitor()
+    {
+        _computer = new Computer
+        {
+            IsCpuEnabled         = true,
+            IsGpuEnabled         = true,
+            IsMemoryEnabled      = false,   // RAM metrics from Win32 API
+            IsStorageEnabled     = true,    // Needed for disk temperature
+            IsNetworkEnabled     = false,   // Network from .NET
+            IsControllerEnabled  = true,    // Fan controllers (SuperIO, EC)
+            IsMotherboardEnabled = true,    // Exposes SuperIO/EC sub-hardware for fan RPM
+        };
+        _computer.Open();
+
+        // Cache hardware names on startup
+        foreach (var hw in _computer.Hardware)
+        {
+            if (hw.HardwareType == HardwareType.Cpu)
+            {
+                CpuName = hw.Name;
+            }
+            else if (hw.HardwareType is HardwareType.GpuNvidia
+                                     or HardwareType.GpuAmd
+                                     or HardwareType.GpuIntel)
+            {
+                GpuName = hw.Name;
+            }
+        }
+    }
+
+    public void Refresh()
+    {
+        foreach (var hw in _computer.Hardware)
+        {
+            hw.Update();
+
+            switch (hw.HardwareType)
+            {
+                case HardwareType.Cpu:
+                    ReadCpu(hw);
+                    break;
+                case HardwareType.GpuNvidia:
+                case HardwareType.GpuAmd:
+                case HardwareType.GpuIntel:
+                    ReadGpu(hw);
+                    break;
+                case HardwareType.Storage:
+                    ReadStorage(hw);
+                    break;
+            }
+
+            // Sub-hardware covers fan controllers (SuperIO, EC) under CPU and Motherboard
+            foreach (var sub in hw.SubHardware)
+            {
+                sub.Update();
+                ReadFan(sub);
+            }
+
+            ReadFan(hw);
+        }
+    }
+
+    private void ReadCpu(IHardware hw)
+    {
+        float temp = 0, usage = 0, usageFallback = 0, freq = 0;
+        foreach (var s in hw.Sensors)
+        {
+            if (s.Value is null) continue;
+            switch (s.SensorType)
+            {
+                // Accept any temperature sensor — covers Intel "Package", AMD "Tdie"/"Tctl", etc.
+                case SensorType.Temperature:
+                    if (s.Value > temp) temp = s.Value.Value;
+                    break;
+
+                case SensorType.Load
+                    when s.Name.Contains("Total", StringComparison.OrdinalIgnoreCase):
+                    usage = s.Value.Value;
+                    break;
+
+                // Fallback: first load sensor if "Total" is not present
+                case SensorType.Load:
+                    if (usageFallback == 0) usageFallback = s.Value.Value;
+                    break;
+
+                case SensorType.Clock
+                    when s.Name.Contains("Core", StringComparison.OrdinalIgnoreCase):
+                    if (s.Value > freq) freq = s.Value.Value;
+                    break;
+            }
+        }
+        if (temp  > 0) CpuTemp    = temp;
+        float finalUsage = usage > 0 ? usage : usageFallback;
+        if (finalUsage > 0) CpuUsage   = finalUsage;
+        if (freq  > 0) CpuFreqMHz = freq;
+    }
+
+    private void ReadGpu(IHardware hw)
+    {
+        float temp = 0, usage = 0, usageFallback = 0;
+        foreach (var s in hw.Sensors)
+        {
+            if (s.Value is null) continue;
+            switch (s.SensorType)
+            {
+                case SensorType.Temperature:
+                    if (s.Value > temp) temp = s.Value.Value;
+                    break;
+                case SensorType.Load
+                    when s.Name.Contains("Core", StringComparison.OrdinalIgnoreCase)
+                      || s.Name.Contains("GPU",  StringComparison.OrdinalIgnoreCase):
+                    usage = s.Value.Value;
+                    break;
+                // Fallback: first load sensor found (D3D, shader, etc.)
+                case SensorType.Load:
+                    if (usageFallback == 0) usageFallback = s.Value.Value;
+                    break;
+            }
+        }
+        if (temp  > 0) GpuTemp  = temp;
+        float finalUsage = usage > 0 ? usage : usageFallback;
+        if (finalUsage > 0) GpuUsage = finalUsage;
+    }
+
+    private void ReadStorage(IHardware hw)
+    {
+        foreach (var s in hw.Sensors)
+        {
+            if (s.SensorType == SensorType.Temperature && s.Value is > 0)
+            {
+                DiskTempC = s.Value.Value;
+                return;
+            }
+        }
+    }
+
+    private void ReadFan(IHardware hw)
+    {
+        foreach (var s in hw.Sensors)
+        {
+            if (s.SensorType == SensorType.Fan && s.Value is > 0)
+            {
+                FanRpm = s.Value.Value;
+                return;
+            }
+        }
+    }
+
+    public void Dispose() => _computer.Close();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  WIN32 HELPERS  (RAM, Disk, Battery)
+// ═══════════════════════════════════════════════════════════════
+static class WinMetrics
+{
+    // ── Memory ──────────────────────────────────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORYSTATUSEX
+    {
+        public uint  dwLength;
+        public uint  dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+    public record MemInfo(double UsedGB, double AvailGB, double TotalGB, int UsagePct);
+
+    public static MemInfo GetMemory()
+    {
+        var ms = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+        GlobalMemoryStatusEx(ref ms);
+        double total = ms.ullTotalPhys / (1024.0 * 1024 * 1024);
+        double avail = ms.ullAvailPhys / (1024.0 * 1024 * 1024);
+        double used  = total - avail;
+        int    pct   = (int)Math.Round(100.0 * used / Math.Max(1, total));
+        return new(Math.Round(used, 1), Math.Round(avail, 1), Math.Round(total, 1), pct);
+    }
+
+    // ── Disk ─────────────────────────────────────────────────────
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern bool GetDiskFreeSpaceEx(
+        string lpDirectoryName,
+        out ulong lpFreeBytesAvailable,
+        out ulong lpTotalNumberOfBytes,
+        out ulong lpTotalNumberOfFreeBytes);
+
+    public record DiskInfo(long UsedGB, long TotalGB, int UsagePct);
+
+    public static DiskInfo GetDisk(string path = "C:\\")
+    {
+        GetDiskFreeSpaceEx(path, out _, out ulong total, out ulong free);
+        const double gb = 1024.0 * 1024 * 1024;
+        long totalGB = (long)(total / gb);
+        long freeGB  = (long)(free  / gb);
+        long usedGB  = totalGB - freeGB;
+        int  pct     = totalGB > 0 ? (int)Math.Round(100.0 * usedGB / totalGB) : 0;
+        return new(usedGB, totalGB, pct);
+    }
+
+    // ── Battery ──────────────────────────────────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SYSTEM_POWER_STATUS
+    {
+        public byte  ACLineStatus;
+        public byte  BatteryFlag;
+        public byte  BatteryLifePercent;
+        public byte  SystemStatusFlag;
+        public uint  BatteryLifeTime;
+        public uint  BatteryFullLifeTime;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS lpSystemPowerStatus);
+
+    /// <summary>
+    /// Returns battery percentage 0-100, or 177 if no battery present (desktop).
+    /// </summary>
+    public static int GetBatteryPct()
+    {
+        GetSystemPowerStatus(out var s);
+        if (s.BatteryFlag == 128) return 177;   // 128 = NoSystemBattery sentinel
+        return s.BatteryLifePercent;            // already 0-100
+    }
+
+    // ── RAM vendor (WMI) ─────────────────────────────────────────
+    private static string? _ramVendorCache;
+    public static string GetRamVendor()
+    {
+        if (_ramVendorCache != null) return _ramVendorCache;
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT Manufacturer FROM Win32_PhysicalMemory");
+            foreach (ManagementObject obj in searcher.Get())
+            {
+                var m = obj["Manufacturer"]?.ToString()?.Trim() ?? "";
+                if (!string.IsNullOrEmpty(m) &&
+                    m is not "Unknown" and not "Not Specified" and not "To Be Filled By O.E.M.")
+                {
+                    return _ramVendorCache = NormalizeVendor(m);
+                }
+            }
+        }
+        catch { }
+        return _ramVendorCache = "Memory";
+    }
+
+    // ── Disk label (WMI) ─────────────────────────────────────────
+    private static string? _diskLabelCache;
+    public static string GetDiskLabel()
+    {
+        if (_diskLabelCache != null) return _diskLabelCache;
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT Model FROM Win32_DiskDrive");
+            foreach (ManagementObject obj in searcher.Get())
+            {
+                var model = obj["Model"]?.ToString()?.Trim() ?? "";
+                if (!string.IsNullOrEmpty(model))
+                    return _diskLabelCache = model;
+            }
+        }
+        catch { }
+        return _diskLabelCache = "Disk";
+    }
+
+    private static string NormalizeVendor(string m) => m
+        .Replace("Micron Technology", "Micron")
+        .Replace("Samsung Electronics", "Samsung")
+        .Replace("HYNIX", "SK hynix")
+        .Replace("Hynix",  "SK hynix")
+        .Trim();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  VOLUME  (NAudio Core Audio API)
+// ═══════════════════════════════════════════════════════════════
+static class VolumeHelper
+{
+    public static int GetMasterVolumePct()
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            return (int)Math.Round(device.AudioEndpointVolume.MasterVolumeLevelScalar * 100);
+        }
+        catch { return -1; }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  NETWORK THROUGHPUT
+// ═══════════════════════════════════════════════════════════════
+sealed class NetMeter
+{
+    private NetworkInterface? _iface;
+    private long     _lastRx, _lastTx;
+    private DateTime _lastTime = DateTime.UtcNow;
+
+    public string IfaceName { get; private set; } = "N/A";
+
+    public NetMeter() => Pick();
+
+    private void Pick()
+    {
+        _iface = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == OperationalStatus.Up
+                     && n.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                     && n.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+            .OrderByDescending(n =>
+                n.NetworkInterfaceType == NetworkInterfaceType.Ethernet        ? 3 :
+                n.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ? 3 :
+                n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211   ? 2 : 1)
+            .FirstOrDefault();
+
+        IfaceName = _iface?.Name ?? "N/A";
+        if (_iface is not null)
+        {
+            var s = _iface.GetIPv4Statistics();
+            _lastRx = s.BytesReceived;
+            _lastTx = s.BytesSent;
+        }
+        _lastTime = DateTime.UtcNow;
+    }
+
+    public (double RxKBs, double TxKBs) GetRates()
+    {
+        if (_iface is null) return (0, 0);
+        try
+        {
+            var s  = _iface.GetIPv4Statistics();
+            var now = DateTime.UtcNow;
+            double dt = Math.Max(0.001, (now - _lastTime).TotalSeconds);
+            double rx = Math.Max(0, (s.BytesReceived - _lastRx) / dt / 1024.0);
+            double tx = Math.Max(0, (s.BytesSent     - _lastTx) / dt / 1024.0);
+            _lastRx = s.BytesReceived;
+            _lastTx = s.BytesSent;
+            _lastTime = now;
+            return (rx, tx);
+        }
+        catch { Pick(); return (0, 0); }
+    }
+
+    public static string Fmt(double kBs)
+    {
+        if (kBs < 1024)          return $"{kBs:F1} K/s";
+        if (kBs < 1024 * 1024)   return $"{kBs / 1024:F1} M/s";
+        return                           $"{kBs / 1024 / 1024:F1} G/s";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  OPENWEATHER  (optional, cached)
+// ═══════════════════════════════════════════════════════════════
+record WeatherData(int WeatherN, int Lo, int Hi, string Zone, string Desc);
+
+sealed class WeatherCache
+{
+    private readonly string _apiKey;
+    private readonly string _location;
+    private readonly string _units;
+    private readonly int    _refreshSec;
+    private WeatherData?    _data;
+    private DateTime        _lastFetch  = DateTime.MinValue;
+    private bool            _warnedNoKey;
+
+    public WeatherData? Current => _data;
+
+    public WeatherCache(string apiKey, string location,
+                        string units = "metric", int refreshSec = 600)
+    {
+        _apiKey     = apiKey.Trim();
+        _location   = location.Trim();
+        _units      = units;
+        _refreshSec = refreshSec;
+    }
+
+    public void RefreshIfStale()
+    {
+        if ((DateTime.UtcNow - _lastFetch).TotalSeconds < _refreshSec) return;
+        _lastFetch = DateTime.UtcNow;  // prevent rapid retries on failure
+
+        if (string.IsNullOrEmpty(_apiKey))
+        {
+            if (!_warnedNoKey)
+            {
+                Console.WriteLine("[Weather] No API key — DATE tile will have blank weather fields.");
+                Console.WriteLine("[Weather] Set env var OW_API_KEY to enable weather.");
+                _warnedNoKey = true;
+            }
+            return;
+        }
+
+        // Fetch in background — don't block the serial loop
+        Task.Run(async () =>
+        {
+            try
+            {
+                var result = await FetchAsync();
+                if (result is not null)
+                {
+                    _data = result;
+                    Console.WriteLine($"[Weather] Updated: code={result.WeatherN} " +
+                                      $"lo={result.Lo} hi={result.Hi} zone={result.Zone}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Weather] Error: {ex.Message}");
+            }
+        });
+    }
+
+    private async Task<WeatherData?> FetchAsync()
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        http.DefaultRequestHeaders.Add("User-Agent", "AtomManDisplay/1.0");
+
+        var (lat, lon, zone) = await ResolveLocationAsync(http);
+        if (lat == 0 && lon == 0) return null;
+
+        string url = $"https://api.openweathermap.org/data/3.0/onecall?" +
+                     $"lat={lat:F6}&lon={lon:F6}&units={_units}&lang=en" +
+                     $"&exclude=minutely,hourly,alerts&appid={_apiKey}";
+
+        string json = await http.GetStringAsync(url);
+        using var doc  = JsonDocument.Parse(json);
+        var root       = doc.RootElement;
+        var current    = root.GetProperty("current");
+        var daily      = root.GetProperty("daily")[0];
+        var wArr       = current.GetProperty("weather")[0];
+
+        int    owId     = wArr.GetProperty("id").GetInt32();
+        string icon     = wArr.GetProperty("icon").GetString() ?? "";
+        string desc     = wArr.GetProperty("description").GetString() ?? "";
+        int    weatherN = MapOwId(owId, icon);
+
+        var temps = daily.GetProperty("temp");
+        int lo    = (int)Math.Round(temps.GetProperty("min").GetDouble());
+        int hi    = (int)Math.Round(temps.GetProperty("max").GetDouble());
+
+        return new WeatherData(weatherN, lo, hi, Ascii(zone), Ascii(desc));
+    }
+
+    private async Task<(double lat, double lon, string zone)> ResolveLocationAsync(HttpClient http)
+    {
+        // Already lat,lon?
+        var parts = _location.Split(',');
+        if (parts.Length == 2
+            && double.TryParse(parts[0].Trim(), out double la)
+            && double.TryParse(parts[1].Trim(), out double lo))
+            return (la, lo, _location);
+
+        // City geocoding
+        string url  = $"https://api.openweathermap.org/geo/1.0/direct?" +
+                      $"q={Uri.EscapeDataString(_location)}&limit=1&appid={_apiKey}";
+        string json = await http.GetStringAsync(url);
+        using var doc = JsonDocument.Parse(json);
+        var arr = doc.RootElement;
+        if (arr.GetArrayLength() == 0) return (0, 0, "");
+
+        var ent  = arr[0];
+        double lat2 = ent.GetProperty("lat").GetDouble();
+        double lon2 = ent.GetProperty("lon").GetDouble();
+        string name = ent.TryGetProperty("name",    out var n) ? n.GetString() ?? "" : _location;
+        string cc   = ent.TryGetProperty("country", out var c) ? c.GetString() ?? "" : "";
+        string zone = cc.Length > 0 ? $"{name},{cc}" : name;
+        return (lat2, lon2, zone);
+    }
+
+    // Same mapping as Python _map_openweather_id_to_weatherN()
+    private static int MapOwId(int id, string icon)
+    {
+        bool day = icon.EndsWith("d", StringComparison.OrdinalIgnoreCase);
+        return id switch
+        {
+            800            => day ? 1 : 3,
+            801            => day ? 5 : 6,
+            802            => day ? 7 : 8,
+            803 or 804     => 9,
+            202 or 212 or 232 => 16,
+            _ when id / 100 == 2 => 11,
+            _ when id / 100 == 3 => 13,
+            500            => 13,
+            501            => 14,
+            502 or 503 or 504 => 15,
+            511            => 19,
+            520 or 521 or 522 or 531 => 10,
+            _ when id / 100 == 5 => 14,
+            600            => 22,
+            601            => 23,
+            602 or 621 or 622 => 24,
+            620            => 21,
+            611 or 612 or 615 or 616 => 20,
+            _ when id / 100 == 6 => 22,
+            701 or 741     => 30,
+            711 or 721     => 31,
+            731 or 751     => 27,
+            761 or 762     => 26,
+            771            => 33,
+            781            => 36,
+            _ when id / 100 == 7 => 31,
+            _              => 99,
+        };
+    }
+
+    private static string Ascii(string s) =>
+        new string(s.Select(c => c is >= ' ' and <= '~' ? c : '?').ToArray()).Replace(";", ",");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PAYLOAD BUILDERS  (match Python p_xxx() functions exactly)
+// ═══════════════════════════════════════════════════════════════
+static class Payloads
+{
+    public static string Cpu(HardwareMonitor hw)
+    {
+        int    temp    = (int)Math.Round(hw.CpuTemp);
+        int    usage   = (int)Math.Round(hw.CpuUsage);
+        long   freqKHz = (long)(hw.CpuFreqMHz * 1000);
+        // {CPU:<name>;Tempr:<°C>;Useage:<pct>;Freq:<kHz>;Tempr1:<°C>;}
+        return $"{{CPU:{hw.CpuName};Tempr:{temp};Useage:{usage};Freq:{freqKHz};Tempr1:{temp};}}";
+    }
+
+    public static string Gpu(HardwareMonitor hw)
+    {
+        int temp  = (int)Math.Round(hw.GpuTemp);
+        int usage = (int)Math.Round(hw.GpuUsage);
+        // {GPU:<name>;Tempr:<°C>;Useage:<pct>}
+        return $"{{GPU:{hw.GpuName};Tempr:{temp};Useage:{usage}}}";
+    }
+
+    public static string Mem()
+    {
+        var m      = WinMetrics.GetMemory();
+        string ven = WinMetrics.GetRamVendor();
+        // {Memory:<vendor>;Used:<GB>;Available:<GB>;Total:<GB>;Useage:<pct>}
+        return $"{{Memory:{ven};Used:{m.UsedGB};Available:{m.AvailGB};Total:{m.TotalGB};Useage:{m.UsagePct}}}";
+    }
+
+    public static string Disk(HardwareMonitor hw)
+    {
+        var d      = WinMetrics.GetDisk("C:\\");
+        string lbl = WinMetrics.GetDiskLabel();
+        int temp   = (int)Math.Round(hw.DiskTempC);
+        // {DiskName:<label>;Tempr:<°C>;UsageSpace:<GB>;AllSpace:<GB>;Usage:<pct>}
+        return $"{{DiskName:{lbl};Tempr:{temp};UsageSpace:{d.UsedGB};AllSpace:{d.TotalGB};Usage:{d.UsagePct}}}";
+    }
+
+    public static string Date(WeatherCache weather)
+    {
+        var now  = DateTime.Now;
+        // Panel week: 0=Sunday … 6=Saturday  (matches .NET DayOfWeek enum)
+        int week = (int)now.DayOfWeek;
+
+        var w = weather.Current;
+        if (w is not null)
+            return $"{{Date:{now:yyyy/MM/dd};Time:{now:HH:mm:ss};Week:{week};" +
+                   $"Weather:{w.WeatherN};TemprLo:{w.Lo},TemprHi:{w.Hi},Zone:{w.Zone},Desc:{w.Desc}}}";
+
+        return $"{{Date:{now:yyyy/MM/dd};Time:{now:HH:mm:ss};Week:{week};" +
+               $"Weather:;TemprLo:,TemprHi:,Zone:,Desc:}}";
+    }
+
+    public static string Net(HardwareMonitor hw, NetMeter net)
+    {
+        var (rx, tx) = net.GetRates();
+        int rpm      = (int)Math.Round(hw.FanRpm);
+        // {SPEED:<rpm>;NETWORK:<rx>,<tx>}
+        return $"{{SPEED:{rpm};NETWORK:{NetMeter.Fmt(rx)},{NetMeter.Fmt(tx)}}}";
+    }
+
+    public static string Vol()
+    {
+        int vol = VolumeHelper.GetMasterVolumePct();
+        return $"{{VOLUME:{vol}}}";
+    }
+
+    public static string Bat()
+    {
+        int pct = WinMetrics.GetBatteryPct();
+        return $"{{Battery:{pct}}}";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SERIAL PROTOCOL
+// ═══════════════════════════════════════════════════════════════
+static class Protocol
+{
+    private static readonly byte[] Trailer = [0xCC, 0x33, 0xC3, 0x3C];
+
+    /// <summary>Build a reply frame: AA tileId 00 seq {payload_latin1} CC33C33C</summary>
+    public static byte[] BuildReply(byte tileId, byte seq, string payload)
+    {
+        byte[] text  = Encoding.Latin1.GetBytes(payload);
+        byte[] frame = new byte[4 + text.Length + 4];
+        frame[0] = 0xAA;
+        frame[1] = tileId;
+        frame[2] = 0x00;
+        frame[3] = seq;
+        text.CopyTo(frame, 4);
+        Trailer.CopyTo(frame, 4 + text.Length);
+        return frame;
+    }
+
+    /// <summary>
+    /// Read one ENQ from the display: AA 05 SEQ CC33C33C
+    /// Returns the SEQ byte or null on timeout / bad frame.
+    /// </summary>
+    public static byte? ReadEnq(SerialPort port)
+    {
+        try
+        {
+            if (port.ReadByte() != 0xAA) return null;
+            if (port.ReadByte() != 0x05) return null;
+            int seq = port.ReadByte();
+            if (seq < 0) return null;
+            for (int i = 0; i < 4; i++)
+                if (port.ReadByte() != Trailer[i]) return null;
+            return (byte)seq;
+        }
+        catch (TimeoutException) { return null; }
+    }
+
+    private static bool IsAsciiSeq(byte b) => b is >= 0x30 and <= 0x39 or 0x3C;
+
+    /// <summary>
+    /// Send CPU/GPU/MEM tiles in rotation while waiting for 3 valid ENQs
+    /// within 2 seconds — this matches Python's unlock_attempt() logic.
+    /// </summary>
+    public static bool UnlockAttempt(SerialPort port, HardwareMonitor hw,
+                                     WeatherCache weather, NetMeter net,
+                                     int attemptIdx, double windowSec)
+    {
+        Console.WriteLine($"[Attempt {attemptIdx}] Unlock window {windowSec:F0}s — echoing CPU/GPU/MEM");
+        var deadline = DateTime.UtcNow.AddSeconds(windowSec);
+
+        byte[] rotation = [Tile.CPU, Tile.GPU, Tile.MEM];
+        int    idx       = 0;
+        int    bootReplies = 0;
+        var    enqTimes  = new Queue<DateTime>();
+
+        while (DateTime.UtcNow < deadline)
+        {
+            hw.Refresh();
+            var seq = ReadEnq(port);
+            if (seq is null) continue;
+
+            // Prune ENQ timestamps older than 2 s
+            enqTimes.Enqueue(DateTime.UtcNow);
+            while (enqTimes.Count > 0 &&
+                   (DateTime.UtcNow - enqTimes.Peek()).TotalSeconds > 2.0)
+                enqTimes.Dequeue();
+
+            byte   tileId  = rotation[idx % rotation.Length];
+            string payload = BuildPayload(tileId, hw, weather, net);
+            byte[] frame   = BuildReply(tileId, seq.Value, payload);
+            port.Write(frame, 0, frame.Length);
+
+            if (IsAsciiSeq(seq.Value)) bootReplies++;
+            idx++;
+
+            if (bootReplies >= 3 && enqTimes.Count >= 5)
+            {
+                Console.WriteLine($"[Attempt {attemptIdx}] Display activated.");
+                return true;
+            }
+        }
+
+        Console.WriteLine($"[Attempt {attemptIdx}] Timed out — no activation.");
+        return false;
+    }
+
+    public static string BuildPayload(byte tileId, HardwareMonitor hw,
+                                      WeatherCache weather, NetMeter net)
+        => tileId switch
+        {
+            Tile.CPU => Payloads.Cpu(hw),
+            Tile.GPU => Payloads.Gpu(hw),
+            Tile.MEM => Payloads.Mem(),
+            Tile.DSK => Payloads.Disk(hw),
+            Tile.DAT => Payloads.Date(weather),
+            Tile.NET => Payloads.Net(hw, net),
+            Tile.VOL => Payloads.Vol(),
+            Tile.BAT => Payloads.Bat(),
+            _        => "",
+        };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DASHBOARD  (optional, console)
+// ═══════════════════════════════════════════════════════════════
+static class Dashboard
+{
+    private static DateTime _lastPrint = DateTime.MinValue;
+
+    public static void Render(HardwareMonitor hw, WeatherCache weather, NetMeter net,
+                              bool show, double minIntervalSec = 1.0)
+    {
+        if (!show) return;
+        if ((DateTime.Now - _lastPrint).TotalSeconds < minIntervalSec) return;
+        _lastPrint = DateTime.Now;
+
+        Console.Clear();
+        Console.WriteLine($"AtomMan   {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        Console.WriteLine(new string('─', 60));
+        Console.WriteLine($"CPU Model  : {hw.CpuName}");
+        Console.WriteLine($"CPU Temp   : {hw.CpuTemp:F0} °C");
+        Console.WriteLine($"CPU Usage  : {hw.CpuUsage:F0} %");
+        Console.WriteLine($"CPU Freq   : {hw.CpuFreqMHz * 1000:F0} kHz");
+        Console.WriteLine();
+        Console.WriteLine($"GPU Model  : {hw.GpuName}");
+        Console.WriteLine($"GPU Temp   : {hw.GpuTemp:F0} °C");
+        Console.WriteLine($"GPU Usage  : {hw.GpuUsage:F0} %");
+        Console.WriteLine();
+        var m = WinMetrics.GetMemory();
+        Console.WriteLine($"RAM Vendor : {WinMetrics.GetRamVendor()}");
+        Console.WriteLine($"RAM Used   : {m.UsedGB} GB  /  {m.TotalGB} GB  ({m.UsagePct} %)");
+        Console.WriteLine();
+        var d = WinMetrics.GetDisk("C:\\");
+        Console.WriteLine($"Disk Label : {WinMetrics.GetDiskLabel()}");
+        Console.WriteLine($"Disk Temp  : {hw.DiskTempC:F0} °C");
+        Console.WriteLine($"Disk Used  : {d.UsedGB} GB  /  {d.TotalGB} GB  ({d.UsagePct} %)");
+        Console.WriteLine();
+        var (rx, tx) = net.GetRates();
+        Console.WriteLine($"Net Iface  : {net.IfaceName}");
+        Console.WriteLine($"Net RX/TX  : {NetMeter.Fmt(rx)}  /  {NetMeter.Fmt(tx)}");
+        Console.WriteLine($"Fan Speed  : {hw.FanRpm:F0} RPM");
+        Console.WriteLine($"Volume     : {VolumeHelper.GetMasterVolumePct()} %");
+        Console.WriteLine($"Battery    : {WinMetrics.GetBatteryPct()} %");
+        Console.WriteLine();
+        var w = weather.Current;
+        if (w is not null)
+        {
+            Console.WriteLine($"Weather    : ONLINE  (code {w.WeatherN})");
+            Console.WriteLine($"Temp Lo/Hi : {w.Lo} / {w.Hi} °C");
+            Console.WriteLine($"Zone       : {w.Zone}");
+            Console.WriteLine($"Desc       : {w.Desc}");
+        }
+        else
+        {
+            Console.WriteLine("Weather    : OFFLINE / no API key");
+        }
+        Console.WriteLine(new string('─', 60));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ENTRY POINT
+// ═══════════════════════════════════════════════════════════════
+class Program
+{
+    // ── Configuration — edit here or use environment variables ──
+    private const  string DefaultPort     = "COM3";
+    private const  int    BaudRate        = 115200;
+    private const  int    UnlockAttempts  = 3;
+    private const  double UnlockWindowSec = 5.0;
+    private const  double StartDelaySec   = 3.0;
+    private const  int    PostWriteMs     = 6;    // matches Python POST_WRITE_SLEEP 0.006 s
+
+    // Weather: set OW_API_KEY env var (free tier at openweathermap.org)
+    private static readonly string ApiKey   = Env("OW_API_KEY",   "");
+    private static readonly string Location = Env("OW_LOCATION",  "Monterrey,MX");
+    private static readonly string Units    = Env("OW_UNITS",     "metric");
+
+    // Tile rotation — same order as Python FULL_ROT
+    private static readonly byte[] Rotation =
+    [
+        Tile.CPU, Tile.GPU, Tile.MEM, Tile.DSK,
+        Tile.DAT, Tile.NET, Tile.VOL, Tile.BAT,
+    ];
+
+    static void Main(string[] args)
+    {
+        bool showDashboard = args.Contains("--dashboard");
+        string portName    = Env("ATOMMAN_PORT", DefaultPort);
+
+        // First non-flag arg can be port name (e.g. "COM4")
+        foreach (var a in args)
+            if (a.StartsWith("COM", StringComparison.OrdinalIgnoreCase)) portName = a;
+
+        Console.WriteLine($"[AtomMan] Port={portName}  Baud={BaudRate}");
+        Console.WriteLine("[AtomMan] Initialising LibreHardwareMonitor...");
+        Console.WriteLine("[AtomMan] NOTE: Run as Administrator for CPU/GPU temperatures.");
+
+        using var hw = new HardwareMonitor();
+        var weather  = new WeatherCache(ApiKey, Location, Units);
+        var net      = new NetMeter();
+
+        // Graceful Ctrl-C / SIGTERM
+        bool shutdown = false;
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown = true; };
+
+        // Pre-fetch weather in background immediately
+        weather.RefreshIfStale();
+
+        // ── Start delay ─────────────────────────────────────────
+        Console.WriteLine($"[AtomMan] Waiting {StartDelaySec}s for USB CDC driver...");
+        Thread.Sleep((int)(StartDelaySec * 1000));
+
+        // ── Open serial port ────────────────────────────────────
+        using var port = new SerialPort(portName, BaudRate, Parity.None, 8, StopBits.One)
+        {
+            ReadTimeout  = 1000,
+            WriteTimeout = 1000,
+            DtrEnable    = true,
+            RtsEnable    = false,
+        };
+
+        try
+        {
+            port.Open();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AtomMan] Cannot open {portName}: {ex.Message}");
+            Console.WriteLine("[AtomMan] Check Device Manager for the correct COM port.");
+            return;
+        }
+
+        port.DiscardInBuffer();
+        port.DiscardOutBuffer();
+        Console.WriteLine($"[AtomMan] {portName} opened.");
+
+        // ── Unlock phase ─────────────────────────────────────────
+        bool activated = false;
+        for (int i = 1; i <= UnlockAttempts && !shutdown; i++)
+        {
+            activated = Protocol.UnlockAttempt(port, hw, weather, net,
+                                               i, UnlockWindowSec);
+            if (activated) break;
+
+            // DTR toggle to reset display state (same as Python)
+            port.DtrEnable = false;
+            Thread.Sleep(50);
+            port.DtrEnable = true;
+            Thread.Sleep(300);
+        }
+
+        if (!activated)
+            Console.WriteLine("[WARN] Display may not be fully activated; continuing anyway.");
+        else
+            Console.WriteLine("[OK] Display activated — steady state.");
+
+        // ── Steady-state loop ─────────────────────────────────────
+        int tileIdx = 0;
+        while (!shutdown)
+        {
+            hw.Refresh();
+            weather.RefreshIfStale();
+
+            var seq = Protocol.ReadEnq(port);
+
+            if (seq is null)
+            {
+                // No ENQ — render dashboard if enabled
+                Dashboard.Render(hw, weather, net, showDashboard);
+                continue;
+            }
+
+            // Pick next tile in rotation; use fixed per-tile SEQ (steady state)
+            byte tileId  = Rotation[tileIdx % Rotation.Length];
+            byte seqByte = Tile.SeqFor(tileId);
+            tileIdx++;
+
+            string payload = Protocol.BuildPayload(tileId, hw, weather, net);
+            byte[] frame   = Protocol.BuildReply(tileId, seqByte, payload);
+
+            port.Write(frame, 0, frame.Length);
+            Thread.Sleep(PostWriteMs);
+
+            Dashboard.Render(hw, weather, net, showDashboard);
+        }
+
+        Console.WriteLine("[AtomMan] Shutting down.");
+        port.Close();
+    }
+
+    private static string Env(string key, string def) =>
+        Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : def;
+}
