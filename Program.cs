@@ -72,6 +72,8 @@ sealed class HardwareMonitor : IDisposable
 
     public HardwareMonitor()
     {
+        PawnIo.EnsureRunning();
+
         _computer = new Computer
         {
             IsCpuEnabled         = true,
@@ -263,6 +265,90 @@ sealed class HardwareMonitor : IDisposable
     }
 
     public void Dispose() => _computer.Close();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PAWNIO DRIVER MANAGER
+//  LHM 0.9.5+ requires the PawnIO kernel driver for temperature
+//  sensors on Intel Core Ultra (Meteor Lake) and other modern CPUs.
+//  The PawnIO installer leaves the service registration and the .sys
+//  in the Windows DriverStore even after uninstall, so we can simply
+//  start the service without needing to re-install anything.
+// ═══════════════════════════════════════════════════════════════
+static class PawnIo
+{
+    const string Name = "PawnIO";
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    static extern IntPtr OpenSCManager(string? machine, string? db, uint access);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    static extern IntPtr OpenService(IntPtr scm, string name, uint access);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool StartService(IntPtr svc, uint argc, IntPtr argv);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool CloseServiceHandle(IntPtr h);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool QueryServiceStatus(IntPtr svc, out SERVICE_STATUS status);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SERVICE_STATUS
+    {
+        public uint dwServiceType, dwCurrentState, dwControlsAccepted,
+                    dwWin32ExitCode, dwServiceSpecificExitCode,
+                    dwCheckPoint, dwWaitHint;
+    }
+
+    const uint SC_MANAGER_CONNECT    = 0x0001;
+    const uint SERVICE_START         = 0x0010;
+    const uint SERVICE_QUERY         = 0x0004;
+    const uint SERVICE_RUNNING       = 0x00000004;
+    const int  ERROR_ALREADY_RUNNING = 1056;
+
+    public static void EnsureRunning()
+    {
+        IntPtr scm = OpenSCManager(null, null, SC_MANAGER_CONNECT);
+        if (scm == IntPtr.Zero)
+        {
+            Console.WriteLine($"[PawnIO] Cannot open SCM (run as Administrator). Error={Marshal.GetLastWin32Error()}");
+            return;
+        }
+        try
+        {
+            IntPtr svc = OpenService(scm, Name, SERVICE_START | SERVICE_QUERY);
+            if (svc == IntPtr.Zero)
+            {
+                Console.WriteLine("[PawnIO] Service not registered — install PawnIO once to enable temperature sensors.");
+                return;
+            }
+            try
+            {
+                QueryServiceStatus(svc, out var st);
+                if (st.dwCurrentState == SERVICE_RUNNING)
+                {
+                    Console.WriteLine("[PawnIO] Already running.");
+                    return;
+                }
+
+                bool ok = StartService(svc, 0, IntPtr.Zero);
+                if (ok)
+                    Console.WriteLine("[PawnIO] Driver started — temperature sensors enabled.");
+                else
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == ERROR_ALREADY_RUNNING)
+                        Console.WriteLine("[PawnIO] Already running.");
+                    else
+                        Console.WriteLine($"[PawnIO] StartService failed. Error={err}");
+                }
+            }
+            finally { CloseServiceHandle(svc); }
+        }
+        finally { CloseServiceHandle(scm); }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -8,6 +8,9 @@
     <RootNamespace>AtomManDisplay</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="LhmTest\**" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
     <PackageReference Include="System.IO.Ports"         Version="10.0.3" />
     <PackageReference Include="System.Management"       Version="10.0.2" />
