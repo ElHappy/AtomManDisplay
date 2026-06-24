@@ -664,16 +664,34 @@ sealed class NetMeter
 
     public NetMeter() => Pick();
 
+    private static bool IsVirtual(NetworkInterface n)
+    {
+        static bool Has(string s, string sub) =>
+            s.Contains(sub, StringComparison.OrdinalIgnoreCase);
+        return Has(n.Name,        "vEthernet")
+            || Has(n.Name,        "WSL")
+            || Has(n.Name,        "Hyper-V")
+            || Has(n.Description, "Hyper-V")
+            || Has(n.Description, "Virtual")
+            || Has(n.Description, "Pseudo");
+    }
+
     private void Pick()
     {
         _iface = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up
                      && n.NetworkInterfaceType != NetworkInterfaceType.Loopback
-                     && n.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                     && n.NetworkInterfaceType != NetworkInterfaceType.Tunnel
+                     && !IsVirtual(n))
             .OrderByDescending(n =>
-                n.NetworkInterfaceType == NetworkInterfaceType.Ethernet        ? 3 :
-                n.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ? 3 :
-                n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211   ? 2 : 1)
+            {
+                // Interfaces with a default gateway are connected to the internet
+                bool hasGateway = n.GetIPProperties().GatewayAddresses.Count > 0;
+                int typeScore   = n.NetworkInterfaceType == NetworkInterfaceType.Ethernet        ? 3 :
+                                  n.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ? 3 :
+                                  n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211   ? 2 : 1;
+                return (hasGateway ? 10 : 0) + typeScore;
+            })
             .FirstOrDefault();
 
         IfaceName = _iface?.Name ?? "N/A";
@@ -767,6 +785,11 @@ sealed class WeatherCache
                                       $"lo={result.Lo} hi={result.Hi} zone={result.Zone}");
                 }
             }
+            catch (HttpRequestException ex) when (ex.Message.Contains("401"))
+            {
+                Console.WriteLine("[Weather] 401 Unauthorized — API key inválida o aún no activada.");
+                Console.WriteLine("[Weather] Las claves nuevas de OpenWeatherMap tardan hasta 2 horas en activarse.");
+            }
             catch (Exception ex)
             {
                 Console.WriteLine($"[Weather] Error: {ex.Message}");
@@ -782,27 +805,58 @@ sealed class WeatherCache
         var (lat, lon, zone) = await ResolveLocationAsync(http);
         if (lat == 0 && lon == 0) return null;
 
-        string url = $"https://api.openweathermap.org/data/3.0/onecall?" +
-                     $"lat={lat:F6}&lon={lon:F6}&units={_units}&lang=en" +
-                     $"&exclude=minutely,hourly,alerts&appid={_apiKey}";
+        // ── Current conditions (free tier: data/2.5/weather) ─────────────
+        string currentUrl = $"https://api.openweathermap.org/data/2.5/weather?" +
+                            $"lat={lat:F6}&lon={lon:F6}&units={_units}&lang=en&appid={_apiKey}";
+        string currentJson = await GetStringOrThrow(http, currentUrl);
 
-        string json = await http.GetStringAsync(url);
-        using var doc  = JsonDocument.Parse(json);
-        var root       = doc.RootElement;
-        var current    = root.GetProperty("current");
-        var daily      = root.GetProperty("daily")[0];
-        var wArr       = current.GetProperty("weather")[0];
+        using var currentDoc = JsonDocument.Parse(currentJson);
+        var wArr    = currentDoc.RootElement.GetProperty("weather")[0];
+        int  owId   = wArr.GetProperty("id").GetInt32();
+        string icon = wArr.GetProperty("icon").GetString() ?? "";
+        string desc = wArr.GetProperty("description").GetString() ?? "";
+        int weatherN = MapOwId(owId, icon);
 
-        int    owId     = wArr.GetProperty("id").GetInt32();
-        string icon     = wArr.GetProperty("icon").GetString() ?? "";
-        string desc     = wArr.GetProperty("description").GetString() ?? "";
-        int    weatherN = MapOwId(owId, icon);
+        // ── 5-day / 3-hour forecast for today's lo/hi (free tier: data/2.5/forecast) ──
+        string forecastUrl = $"https://api.openweathermap.org/data/2.5/forecast?" +
+                             $"lat={lat:F6}&lon={lon:F6}&units={_units}&lang=en&appid={_apiKey}";
+        string forecastJson = await GetStringOrThrow(http, forecastUrl);
 
-        var temps = daily.GetProperty("temp");
-        int lo    = (int)Math.Round(temps.GetProperty("min").GetDouble());
-        int hi    = (int)Math.Round(temps.GetProperty("max").GetDouble());
+        using var forecastDoc = JsonDocument.Parse(forecastJson);
+        string today = DateTime.Now.ToString("yyyy-MM-dd");
+        double lo = double.MaxValue, hi = double.MinValue;
 
-        return new WeatherData(weatherN, lo, hi, Ascii(zone), Ascii(desc));
+        foreach (var entry in forecastDoc.RootElement.GetProperty("list").EnumerateArray())
+        {
+            string dt = entry.GetProperty("dt_txt").GetString() ?? "";
+            if (!dt.StartsWith(today)) continue;
+            var main = entry.GetProperty("main");
+            double tMin = main.GetProperty("temp_min").GetDouble();
+            double tMax = main.GetProperty("temp_max").GetDouble();
+            if (tMin < lo) lo = tMin;
+            if (tMax > hi) hi = tMax;
+        }
+
+        // Fallback: if no entries matched today use current temp for both
+        if (lo == double.MaxValue)
+        {
+            double cur = currentDoc.RootElement.GetProperty("main")
+                                               .GetProperty("temp").GetDouble();
+            lo = hi = cur;
+        }
+
+        return new WeatherData(weatherN, (int)Math.Round(lo), (int)Math.Round(hi),
+                               Ascii(zone), Ascii(desc));
+    }
+
+    private static async Task<string> GetStringOrThrow(HttpClient http, string url)
+    {
+        var resp = await http.GetAsync(url);
+        string body = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode)
+            throw new HttpRequestException(
+                $"HTTP {(int)resp.StatusCode} from {new Uri(url).Host}: {body}");
+        return body;
     }
 
     private async Task<(double lat, double lon, string zone)> ResolveLocationAsync(HttpClient http)
@@ -817,7 +871,7 @@ sealed class WeatherCache
         // City geocoding
         string url  = $"https://api.openweathermap.org/geo/1.0/direct?" +
                       $"q={Uri.EscapeDataString(_location)}&limit=1&appid={_apiKey}";
-        string json = await http.GetStringAsync(url);
+        string json = await GetStringOrThrow(http, url);
         using var doc = JsonDocument.Parse(json);
         var arr = doc.RootElement;
         if (arr.GetArrayLength() == 0) return (0, 0, "");
@@ -1114,6 +1168,9 @@ static class Dashboard
 // ═══════════════════════════════════════════════════════════════
 class Program
 {
+    // Loaded first — other static fields call Env() during initialization
+    private static readonly Dictionary<string, string> _dotEnv = LoadDotEnv();
+
     // ── Configuration — edit here or use environment variables ──
     private const  string DefaultPort     = "COM3";
     private const  int    BaudRate        = 115200;
@@ -1249,6 +1306,46 @@ class Program
         port.Close();
     }
 
-    private static string Env(string key, string def) =>
-        Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : def;
+    // Reads from .env file first, then falls back to system environment variables.
+    private static Dictionary<string, string> LoadDotEnv()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string path = Path.Combine(AppContext.BaseDirectory, ".env");
+
+        // Also look next to the .csproj when running via "dotnet run"
+        if (!File.Exists(path))
+        {
+            string? dir = Path.GetDirectoryName(AppContext.BaseDirectory.TrimEnd('/', '\\'));
+            while (dir is not null)
+            {
+                string candidate = Path.Combine(dir, ".env");
+                if (File.Exists(candidate)) { path = candidate; break; }
+                string parent = Path.GetDirectoryName(dir)!;
+                if (parent == dir) break;
+                dir = parent;
+            }
+        }
+
+        if (!File.Exists(path)) return map;
+
+        foreach (string raw in File.ReadAllLines(path))
+        {
+            string line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith('#')) continue;
+            int eq = line.IndexOf('=');
+            if (eq <= 0) continue;
+            string key = line[..eq].Trim();
+            string val = line[(eq + 1)..].Trim();
+            if (key.Length > 0) map[key] = val;
+        }
+
+        Console.WriteLine($"[Config] Loaded .env from {path}");
+        return map;
+    }
+
+    private static string Env(string key, string def)
+    {
+        if (_dotEnv.TryGetValue(key, out string? v) && v.Length > 0) return v;
+        return Environment.GetEnvironmentVariable(key) is { Length: > 0 } ev ? ev : def;
+    }
 }
