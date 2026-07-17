@@ -205,6 +205,11 @@ sealed class HardwareMonitor : IDisposable
                     break;
             }
         }
+        // Intel Arc iGPU (Meteor Lake+): IGCL/driver never reports temperature
+        // as supported, so LHM's sensor never appears — read it via PMT instead.
+        if (temp == 0 && GpuPmtTemp.TryRead(out float pmtTemp))
+            temp = pmtTemp;
+
         if (temp  > 0) GpuTemp  = temp;
         float finalUsage = usage > 0 ? usage : usageFallback;
         if (finalUsage > 0) GpuUsage = finalUsage;
@@ -259,12 +264,19 @@ sealed class HardwareMonitor : IDisposable
         Console.WriteLine($"  CPU Freq PC    : {WinMetrics.GetCpuFreqMHz():F0} MHz");
         Console.WriteLine($"  WMI Fan RPM    : {WinMetrics.GetWmiFanRpm():F0}");
         Console.WriteLine($"  ACPI CPU Temp  : {WinMetrics.GetAcpiCpuTempC():F1} °C  (both methods)");
+        Console.WriteLine(GpuPmtTemp.TryRead(out float pmtTemp)
+            ? $"  PMT GPU Temp   : {pmtTemp:F1} °C  (GCD_MAX + calibration, Intel PMT/OOBMSM)"
+            : "  PMT GPU Temp   : unavailable (not Meteor Lake+, or no OOBMSM device)");
         Console.WriteLine("\n  — Extended WMI scan —");
         WinMetrics.DumpWmiThermalFan();
         Console.WriteLine("═══════════════════════════════════════");
     }
 
-    public void Dispose() => _computer.Close();
+    public void Dispose()
+    {
+        _computer.Close();
+        GpuPmtTemp.Shutdown();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

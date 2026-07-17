@@ -17,7 +17,7 @@ for hardware sensor access.
 ## Features
 
 - CPU usage, temperature, and frequency
-- GPU usage (Intel Arc D3D load sensor)
+- GPU usage (Intel Arc D3D load sensor) and temperature (Intel PMT telemetry, see below)
 - RAM usage and vendor
 - SSD temperature and usage
 - Fan RPM via SuperIO / embedded controller
@@ -33,7 +33,6 @@ for hardware sensor access.
 
 | Issue | Details |
 |---|---|
-| **GPU temperature unavailable** | Intel Arc (and some other iGPUs) do not expose a temperature sensor through LibreHardwareMonitor or any standard Windows API. The value is always 0. |
 | **Fan RPM unavailable** | The AtomMan X7 Ti's embedded controller (MTBAC board) is not recognised by LHM and does not expose fan speed through any standard Windows API. The value is always 0. |
 | **CPU temperature unavailable without PawnIO** | Intel Core Ultra (Meteor Lake) CPUs need the PawnIO kernel driver to read thermal MSRs. See **PawnIO Setup** below — it's a required third-party dependency, not bundled with this project. |
 
@@ -71,6 +70,33 @@ install is unavoidable.
    starts it automatically if it isn't already running.
 
 Optional silent install (e.g. scripted setup): `PawnIO_setup.exe -install -silent`.
+
+---
+
+## GPU Temperature via Intel PMT (Meteor Lake+)
+
+Intel's own GPU driver never reports GPU temperature as a supported telemetry item on
+Intel Arc integrated graphics (confirmed against LibreHardwareMonitor's IGCL-based sensor
+code — [LHM PR #2218](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/pull/2218)
+notes the same "driver limitation" on other Core Ultra generations), so LHM's GPU
+temperature sensor never appears and the value is always 0. Linux's `i915` driver can't
+help either — its hwmon interface is explicitly gated to discrete GPUs only.
+
+The value *is* present on-die, exposed through **Intel PMT (Platform Monitoring
+Technology)** telemetry behind the OOBMSM PCI function (`00:0A.0`), reachable with the
+same PawnIO driver already used for CPU temperature. [GpuPmtTemp.cs](GpuPmtTemp.cs) loads
+a small third-party PawnIO module ([`IntelOOBMSM.bin`](PawnIoModules/IntelOOBMSM.bin), from
+[namazso/PawnIO.Modules](https://github.com/namazso/PawnIO.Modules), LGPL-2.1 — bundled in
+this repo, no separate install needed) to map the device's BAR0 and read the byte at
+offset `0x6388`/`0x6389` (`GCD_MIN`/`GCD_MAX` — "Graphics Compute Die" — which matches
+Intel's own published [Intel-PMT](https://github.com/intel/Intel-PMT) telemetry spec
+byte-for-byte). `HardwareMonitor.ReadGpu()` uses this as the fallback whenever LHM
+reports 0, which today is unconditionally the case for this GPU.
+
+> **Calibration note:** the raw `GCD_MAX` byte reads a few degrees below the actual GPU
+> temperature. A fixed **+4°C** correction is applied in `GpuPmtTemp.CalibrationOffsetC`,
+> derived empirically on one AtomMan X7 Ti. If it looks off on different silicon, adjust
+> that constant.
 
 ---
 
@@ -188,7 +214,8 @@ nssm start AtomMan
 | Symptom | Fix |
 |---|---|
 | CPU temperature is 0 | Run as Administrator; install the PawnIO driver — see **PawnIO Setup** above |
-| GPU temperature is 0 | Known limitation — Intel Arc does not expose temperature through any standard API |
+| GPU temperature is 0 | Run as Administrator; requires a Meteor Lake+ CPU with an OOBMSM device at PCI `00:0A.0` — see **GPU Temperature via Intel PMT** above. Run `--debug` and check the `PMT GPU Temp` line to confirm whether it's readable at all on your hardware |
+| GPU temperature looks off by a few °C | The `+4°C` calibration in `GpuPmtTemp.cs` was derived on one machine — see the calibration note in **GPU Temperature via Intel PMT** above |
 | Fan RPM is 0 | Known limitation — embedded controller not recognised on some boards (e.g. MTBAC) |
 | Port not found | Check Device Manager for the correct COM port number and update `ATOMMAN_PORT` in `.env` |
 | Display shows nothing | Check that the unlock phase prints "Display activated" in the console |
