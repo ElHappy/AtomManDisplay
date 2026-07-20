@@ -671,6 +671,7 @@ sealed class NetMeter
     private NetworkInterface? _iface;
     private long     _lastRx, _lastTx;
     private DateTime _lastTime = DateTime.UtcNow;
+    private DateTime _lastPickAttempt = DateTime.MinValue;
 
     public string IfaceName { get; private set; } = "N/A";
 
@@ -690,6 +691,7 @@ sealed class NetMeter
 
     private void Pick()
     {
+        _lastPickAttempt = DateTime.UtcNow;
         _iface = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up
                      && n.NetworkInterfaceType != NetworkInterfaceType.Loopback
@@ -718,7 +720,15 @@ sealed class NetMeter
 
     public (double RxKBs, double TxKBs) GetRates()
     {
-        if (_iface is null) return (0, 0);
+        // No adapter was up yet the last time we looked (e.g. this process was
+        // launched by a boot-time service before Wi-Fi/Ethernet finished
+        // coming up) — keep retrying instead of staying stuck at N/A forever.
+        if (_iface is null)
+        {
+            if ((DateTime.UtcNow - _lastPickAttempt).TotalSeconds < 5) return (0, 0);
+            Pick();
+            if (_iface is null) return (0, 0);
+        }
         try
         {
             var s  = _iface.GetIPv4Statistics();
